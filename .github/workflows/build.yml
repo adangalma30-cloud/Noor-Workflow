@@ -22,7 +22,7 @@ on:
       - master
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -137,6 +137,8 @@ jobs:
           "$BT/apksigner" verify --verbose --print-certs "$APK"
           echo "=== 5/5 package identity (aapt2) ==="
           "$BT/aapt2" dump badging "$APK" | head -3
+          echo "=== 6/6 JavaScript bundle embedded (the splash-stuck cause) ==="
+          unzip -l "$APK" | grep -F "assets/index.android.bundle"
           SHA=$(sha256sum "$APK" | cut -d' ' -f1)
           SIZE=$(stat -c%s "$APK")
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
@@ -150,6 +152,7 @@ jobs:
             echo "| unzip -t (entry CRCs) | OK |"
             echo "| zipalign -c | OK |"
             echo "| apksigner verify | OK |"
+            echo "| JS bundle embedded | OK |"
             echo "| size | $SIZE bytes |"
             echo "| SHA-256 | \`$SHA\` |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -162,6 +165,35 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload APK as direct download (GitHub Release)
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="${{ steps.apk.outputs.path }}"
+          SHA="${{ steps.verify.outputs.sha256 }}"
+          TYPE="${{ inputs.build_type || 'debug' }}"
+          VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
+          ASSET="Noor-${VER}-${TYPE}-${SHA:0:8}.apk"
+          cp "$APK" "$ASSET"
+          echo "${SHA}  ${ASSET}" > "${ASSET}.sha256"
+          gh release delete apk-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create apk-latest --repo "$GITHUB_REPOSITORY" \
+            --title "Noor ${VER} - ${TYPE} APK" \
+            --notes "Verified standalone build of https://github.com/adangalma30-cloud/Noor (${TYPE}).
+
+          File: ${ASSET}
+          Size: $(stat -c%s "$ASSET") bytes
+          SHA-256: ${SHA}
+
+          Checks passed: entry CRCs (unzip -t), zipalign, apksigner verify, aapt2 identity, JS bundle embedded." \
+            "$ASSET" "${ASSET}.sha256"
+          {
+            echo "## Direct download"
+            echo "- APK: https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/${ASSET}"
+            echo "- SHA-256: \`${SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload Gradle reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -170,3 +202,4 @@ jobs:
           path: noor/android/app/build/reports/
           if-no-files-found: ignore
           retention-days: 7
+
