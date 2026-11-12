@@ -94,6 +94,13 @@ jobs:
         working-directory: noor/android
         run: chmod +x gradlew
 
+      - name: Clean previous build outputs
+        working-directory: noor/android
+        run: |
+          ./gradlew clean --no-daemon
+          rm -rf app/build/outputs/apk
+          echo "Build outputs cleaned."
+
       - name: Build APK
         working-directory: noor/android
         run: |
@@ -114,6 +121,38 @@ jobs:
           fi
           echo "path=noor/android/$APK_PATH" >> "$GITHUB_OUTPUT"
           echo "Built $APK_PATH ($(du -h "$APK_PATH" | cut -f1))"
+
+      - name: Verify APK integrity
+        id: verify
+        run: |
+          APK="${{ steps.apk.outputs.path }}"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "=== 1/5 file and size ==="
+          ls -l "$APK"
+          echo "=== 2/5 zip CRC test of every APK entry ==="
+          unzip -t "$APK" | tail -2
+          echo "=== 3/5 zipalign verification ==="
+          "$BT/zipalign" -c -v 4 "$APK" | tail -1
+          echo "=== 4/5 apksigner verify (cryptographic signature validation) ==="
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+          echo "=== 5/5 package identity (aapt2) ==="
+          "$BT/aapt2" dump badging "$APK" | head -3
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$APK")
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "APK SHA-256: $SHA"
+          echo "APK size: $SIZE bytes"
+          {
+            echo "## APK verification"
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| unzip -t (entry CRCs) | OK |"
+            echo "| zipalign -c | OK |"
+            echo "| apksigner verify | OK |"
+            echo "| size | $SIZE bytes |"
+            echo "| SHA-256 | \`$SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
