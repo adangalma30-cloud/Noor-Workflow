@@ -180,8 +180,10 @@ jobs:
           done < "$RUNNER_TEMP/apk-list.txt"
           echo "sha-list:"
           cat "$RUNNER_TEMP/sha-list.txt"
-          cp "$REPORT" verify-summary.md
-          cp "$RUNNER_TEMP/sha-list.txt" sha-list.txt
+          mkdir -p stage
+          cp "$REPORT" stage/verify-summary.md
+          cp "$RUNNER_TEMP/sha-list.txt" stage/sha-list.txt
+          cp "$RUNNER_TEMP/apk-list.txt" stage/apk-list.txt
           if [ "$FAIL" -ne 0 ]; then
             echo "APK verification FAILED — see report." >&2
             exit 1
@@ -192,10 +194,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: noor-apks
-          path: |
-            ${{ runner.temp }}/apk-list.txt
-            verify-summary.md
-            sha-list.txt
+          path: stage/
           retention-days: 14
           if-no-files-found: error
 
@@ -233,6 +232,36 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # The emulator-runner action executes each line of `script:` in its own
+      # shell, so the whole test is written to a file here and run as a single
+      # command line — variables and `set -e` behave normally inside the file.
+      - name: Write install test script
+        run: |
+          cat > apk-test.sh << 'EOF'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          APK=$(find apks -name "*.apk" | grep "x86_64" | grep -v universal | head -1 || true)
+          if [ -z "$APK" ]; then APK=$(find apks -name "*.apk" | grep -i "universal" | head -1 || true); fi
+          if [ -z "$APK" ]; then APK=$(find apks -name "*.apk" | sort | tail -1 || true); fi
+          echo "Installing: $APK ($(du -h "$APK" | cut -f1))"
+          adb install -r "$APK" | tee install-out.txt
+          grep -q "Success" install-out.txt
+          echo "Launching com.adangalma30.noor/.MainActivity"
+          adb shell am start -n com.adangalma30.noor/.MainActivity | tee launch-out.txt
+          sleep 18
+          PID=$(adb shell pidof com.adangalma30.noor | tr -d '\r' || true)
+          echo "pid: '$PID'"
+          test -n "$PID"
+          adb shell dumpsys activity activities | tee resumed.txt | grep -i "ResumedActivity.*noor"
+          adb logcat -d > logcat.txt || true
+          if grep -q "FATAL EXCEPTION" logcat.txt && grep -qi "noor" logcat.txt; then
+            echo "FATAL exception found for Noor"
+            exit 1
+          fi
+          echo "INSTALL AND LAUNCH TEST: PASSED"
+          EOF
+          chmod +x apk-test.sh
+
       - name: Install and launch on Android emulator
         id: test
         uses: reactivecircus/android-emulator-runner@v2
@@ -242,51 +271,26 @@ jobs:
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
           disable-animations: true
-          script: |
-            set -e
-            # Prefer the x86_64-specific APK (smaller/faster), fall back to universal.
-            APK=$(find apks -name "*.apk" | grep "x86_64" | head -1)
-            [ -z "$APK" ] && APK=$(find apks -name "*.apk" | grep -i "universal" | head -1)
-            [ -z "$APK" ] && APK=$(find apks -name "*.apk" | sort | tail -1)
-            echo "Installing: $APK ($(du -h "$APK" | cut -f1))"
-            adb install -r "$APK" | tee install-out.txt
-            grep -q "Success" install-out.txt
-            echo "Launching com.adangalma30.noor/.MainActivity"
-            adb shell am start -n com.adangalma30.noor/.MainActivity | tee launch-out.txt
-            sleep 18
-            PID=$(adb shell pidof com.adangalma30.noor | tr -d '\r' || true)
-            echo "pid: '$PID'"
-            test -n "$PID"
-            adb shell dumpsys activity activities | grep -i "ResumedActivity" | tee resumed.txt
-            grep -qi "noor" resumed.txt
-            adb logcat -d > logcat.txt || true
-            if grep -q "FATAL EXCEPTION" logcat.txt && grep -qi "noor" logcat.txt; then
-              echo "FATAL exception found for Noor"
-              exit 1
-            fi
-            echo "INSTALL AND LAUNCH TEST: PASSED"
+          script: bash apk-test.sh
 
       - name: Write install test result
         if: always()
         run: |
+          mkdir -p itest
           if [ "${{ steps.test.outcome }}" = "success" ]; then
-            echo "Install & launch on Android emulator (API 30, x86_64): **PASSED** — \`adb install\` returned Success, the app process survived launch (\`pidof\` non-empty after 18 s), the resumed activity is Noor, and no FATAL exception was logged." > install-test-result.md
+            echo "Install & launch on Android emulator (API 30, x86_64): **PASSED** — \`adb install\` returned Success, the app process survived launch (\`pidof\` non-empty after 18 s), the resumed activity is Noor, and no FATAL exception was logged." > itest/install-test-result.md
           else
-            echo "Install & launch on Android emulator (API 30, x86_64): **FAILED** — see the uploaded logcat/install artifacts. Installation was NOT verified." > install-test-result.md
+            echo "Install & launch on Android emulator (API 30, x86_64): **FAILED** — see the uploaded logcat/install artifacts. Installation was NOT verified." > itest/install-test-result.md
           fi
-          cat install-test-result.md
+          cp install-out.txt launch-out.txt resumed.txt logcat.txt itest/ 2>/dev/null || true
+          cat itest/install-test-result.md
 
       - name: Upload install test evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: install-test
-          path: |
-            install-test-result.md
-            logcat.txt
-            install-out.txt
-            launch-out.txt
-            resumed.txt
+          path: itest/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -313,7 +317,9 @@ jobs:
           TYPE="${{ inputs.build_type || 'release' }}"
           VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
           mkdir -p assets
-          cp collected/noor-apk-files/*.apk assets/ 2>/dev/null || find collected -name "*.apk" -exec cp {} assets/ \;
+          find collected -name "*.apk" -exec cp {} assets/ \;
+          find collected -name "verify-summary.md" -exec cp {} assets/verify-summary.md \;
+          find collected -name "install-test-result.md" -exec cp {} assets/install-test-result.md \;
           cd assets
           for A in *.apk; do
             SHA=$(sha256sum "$A" | cut -d' ' -f1)
@@ -329,12 +335,12 @@ jobs:
             echo "${SHA}  ${NEW}" > "${NEW}.sha256"
           done
           cd ..
-          cp collected/noor-apks/verify-summary.md assets/Noor-${VER}-VALIDATION-REPORT.md
           {
+            cat assets/verify-summary.md
             echo ""
             echo "## Install & launch test (adb on Android emulator)"
             echo ""
-            cat collected/install-test/install-test-result.md 2>/dev/null || echo "_Install test result unavailable._"
+            cat assets/install-test-result.md 2>/dev/null || echo "_Install test result unavailable._"
             echo ""
             echo "## Sizes"
             echo ""
@@ -343,7 +349,8 @@ jobs:
             for F in assets/*.apk; do
               echo "| $(basename "$F") | $(stat -c%s "$F") |"
             done
-          } >> assets/Noor-${VER}-VALIDATION-REPORT.md
+          } > "assets/Noor-${VER}-VALIDATION-REPORT.md"
+          rm -f assets/verify-summary.md assets/install-test-result.md
           echo "=== assets ==="
           ls -la assets/
 
