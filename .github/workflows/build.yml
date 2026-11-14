@@ -11,11 +11,11 @@ on:
       build_type:
         description: "APK build type"
         required: false
-        default: "debug"
+        default: "release"
         type: choice
         options:
-          - debug
           - release
+          - debug
   push:
     branches:
       - main
@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Android ${{ inputs.build_type || 'debug' }} APK
+    name: Build Android ${{ inputs.build_type || 'release' }} APK
     runs-on: ubuntu-latest
 
     steps:
@@ -42,27 +42,19 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          # Cache on the lockfile so the key changes only when deps change.
           cache-dependency-path: noor/package-lock.json
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          # Expo SDK 58 / Gradle 9 build with JDK 21.
           java-version: "21"
 
       - name: Install Android SDK packages
-        # The GitHub runner ships a licensed Android SDK (ANDROID_HOME).
-        # android-actions/setup-android is not needed and currently breaks on
-        # the removed legacy 'tools' package.
         run: |
           SDKMGR=$(find "$ANDROID_HOME" -name sdkmanager -type f -path "*bin*" | sort | tail -1)
           echo "Using $SDKMGR"
           yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
-          # Android ships API 37 as minor-versioned packages (37.0/37.1/37.2);
-          # Expo's Gradle plugin compiles against "android-37", so link the
-          # installed minor to the plain name AGP resolves.
           "$SDKMGR" "platforms;android-37.0" "platforms;android-36" "build-tools;37.0.0"
           if [ ! -d "$ANDROID_HOME/platforms/android-37" ]; then
             SRC=$(ls -d "$ANDROID_HOME"/platforms/android-37.0 2>/dev/null | head -1)
@@ -104,95 +96,116 @@ jobs:
       - name: Build APK
         working-directory: noor/android
         run: |
-          if [ "${{ inputs.build_type || 'debug' }}" = "release" ]; then
-            ./gradlew assembleRelease --no-daemon --stacktrace
-          else
+          if [ "${{ inputs.build_type || 'release' }}" = "debug" ]; then
             ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            ./gradlew assembleRelease --no-daemon --stacktrace
           fi
 
-      - name: Locate APK
+      - name: Locate APKs (per-architecture + universal)
         id: apk
-        working-directory: noor/android
         run: |
-          APK_PATH=$(find app/build/outputs/apk -name "*.apk" | head -1)
-          if [ -z "$APK_PATH" ]; then
+          APK_COUNT=$(find noor/android/app/build/outputs/apk -name "*.apk" | wc -l)
+          if [ "$APK_COUNT" -eq 0 ]; then
             echo "No APK was produced." >&2
             exit 1
           fi
-          echo "path=noor/android/$APK_PATH" >> "$GITHUB_OUTPUT"
-          echo "Built $APK_PATH ($(du -h "$APK_PATH" | cut -f1))"
+          find noor/android/app/build/outputs/apk -name "*.apk" | sort | tee "$RUNNER_TEMP/apk-list.txt"
+          echo "Produced $APK_COUNT APK(s):"
+          while read -r A; do echo " - $A ($(du -h "$A" | cut -f1))"; done < "$RUNNER_TEMP/apk-list.txt"
+          echo "count=$APK_COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Verify APK integrity
+      - name: Verify APK integrity (each APK)
         id: verify
         run: |
-          APK="${{ steps.apk.outputs.path }}"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          echo "=== 1/5 file and size ==="
-          ls -l "$APK"
-          echo "=== 2/5 zip CRC test of every APK entry ==="
-          unzip -t "$APK" | tail -2
-          echo "=== 3/5 zipalign verification ==="
-          "$BT/zipalign" -c -v 4 "$APK" | tail -1
-          echo "=== 4/5 apksigner verify (cryptographic signature validation) ==="
-          "$BT/apksigner" verify --verbose --print-certs "$APK"
-          echo "=== 5/5 package identity (aapt2) ==="
-          "$BT/aapt2" dump badging "$APK" | head -3
-          echo "=== 6/6 JavaScript bundle embedded (the splash-stuck cause) ==="
-          unzip -l "$APK" | grep -F "assets/index.android.bundle"
-          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
-          SIZE=$(stat -c%s "$APK")
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "APK SHA-256: $SHA"
-          echo "APK size: $SIZE bytes"
+          EXPECTED_CERT="fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c"
+          EXPECTED_PKG="com.adangalma30.noor"
+          EXPECTED_VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
+          EXPECTED_CODE=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['android']['versionCode'])")
+          TYPE="${{ inputs.build_type || 'release' }}"
+          REPORT="$RUNNER_TEMP/verify-summary.md"
           {
-            echo "## APK verification"
-            echo "| check | result |"
-            echo "|---|---|"
-            echo "| unzip -t (entry CRCs) | OK |"
-            echo "| zipalign -c | OK |"
-            echo "| apksigner verify | OK |"
-            echo "| JS bundle embedded | OK |"
-            echo "| size | $SIZE bytes |"
-            echo "| SHA-256 | \`$SHA\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "# Noor ${EXPECTED_VER} — APK verification"
+            echo ""
+            echo "Build type: ${TYPE} · expected package \`${EXPECTED_PKG}\` · versionName \`${EXPECTED_VER}\` · versionCode \`${EXPECTED_CODE}\`"
+            echo "Signing certificate continuity: must match all previous releases (\`SHA-256 ${EXPECTED_CERT}\`)."
+            echo ""
+          } > "$REPORT"
+          FAIL=0
+          : > "$RUNNER_TEMP/sha-list.txt"
+          while read -r APK; do
+            NAME=$(basename "$APK")
+            SIZE=$(stat -c%s "$APK")
+            SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+            echo "${SHA}  ${NAME}" >> "$RUNNER_TEMP/sha-list.txt"
+            echo "=== $NAME ($SIZE bytes) ==="
+            unzip -t "$APK" > /dev/null && CRC=OK || { CRC=FAIL; FAIL=1; }
+            "$BT/zipalign" -c -v 4 "$APK" > /dev/null 2>&1 && ALIGN=OK || { ALIGN=FAIL; FAIL=1; }
+            CERTS=$("$BT/apksigner" verify --verbose --print-certs "$APK" 2>&1) && SIG=OK || { SIG=FAIL; FAIL=1; }
+            CERT_SHA=$(echo "$CERTS" | grep -oP 'SHA-256 digest: \K[0-9a-f]+' | head -1)
+            [ "$CERT_SHA" = "$EXPECTED_CERT" ] && CERT=OK || { CERT=FAIL; FAIL=1; }
+            BADGING=$("$BT/aapt2" dump badging "$APK" 2>/dev/null)
+            PKG_OK=$(echo "$BADGING" | grep -q "name='${EXPECTED_PKG}'" && echo OK || { echo FAIL; FAIL=1; })
+            VER_OK=$(echo "$BADGING" | grep -q "versionName='${EXPECTED_VER}'" && echo OK || { echo FAIL; FAIL=1; })
+            CODE_OK=$(echo "$BADGING" | grep -q "versionCode='${EXPECTED_CODE}'" && echo OK || { echo FAIL; FAIL=1; })
+            SDK_OK=$(echo "$BADGING" | grep -q "minSdkVersion:'24'" && echo OK || { echo FAIL; FAIL=1; })
+            if [ "$TYPE" = "release" ]; then
+              echo "$BADGING" | grep -q "application-debuggable" && { DBG="FAIL (debuggable)"; FAIL=1; } || DBG="OK (not debuggable)"
+            else
+              DBG="n/a (debug build)"
+            fi
+            unzip -l "$APK" | grep -q "assets/index.android.bundle" && JS=OK || { JS=FAIL; FAIL=1; }
+            NATIVE=$(echo "$BADGING" | grep "^native-code" || echo "native-code: (none)")
+            {
+              echo "### \`${NAME}\`"
+              echo ""
+              echo "| check | result |"
+              echo "|---|---|"
+              echo "| size | $SIZE bytes |"
+              echo "| SHA-256 | \`$SHA\` |"
+              echo "| zip entry CRCs (unzip -t) | $CRC |"
+              echo "| zipalign -c -v 4 | $ALIGN |"
+              echo "| apksigner verify | $SIG |"
+              echo "| certificate continuity (vs 0.0.1–0.0.3) | $CERT (\`$CERT_SHA\`) |"
+              echo "| package name | $PKG_OK |"
+              echo "| versionName | $VER_OK |"
+              echo "| versionCode | $CODE_OK |"
+              echo "| minSdkVersion 24 | $SDK_OK |"
+              echo "| non-debuggable (release) | $DBG |"
+              echo "| JS bundle embedded | $JS |"
+              echo "| $NATIVE | |"
+              echo ""
+            } >> "$REPORT"
+          done < "$RUNNER_TEMP/apk-list.txt"
+          echo "sha-list:"
+          cat "$RUNNER_TEMP/sha-list.txt"
+          cp "$REPORT" verify-summary.md
+          cp "$RUNNER_TEMP/sha-list.txt" sha-list.txt
+          if [ "$FAIL" -ne 0 ]; then
+            echo "APK verification FAILED — see report." >&2
+            exit 1
+          fi
+          echo "All APK checks passed."
 
-      - name: Upload APK
+      - name: Upload APKs + verification summary
         uses: actions/upload-artifact@v4
         with:
-          name: noor-${{ inputs.build_type || 'debug' }}-apk
-          path: ${{ steps.apk.outputs.path }}
-          if-no-files-found: error
+          name: noor-apks
+          path: |
+            ${{ runner.temp }}/apk-list.txt
+            verify-summary.md
+            sha-list.txt
           retention-days: 14
+          if-no-files-found: error
 
-      - name: Upload APK as direct download (GitHub Release)
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          APK="${{ steps.apk.outputs.path }}"
-          SHA="${{ steps.verify.outputs.sha256 }}"
-          TYPE="${{ inputs.build_type || 'debug' }}"
-          VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
-          ASSET="Noor-${VER}-${TYPE}-${SHA:0:8}.apk"
-          cp "$APK" "$ASSET"
-          echo "${SHA}  ${ASSET}" > "${ASSET}.sha256"
-          gh release delete apk-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create apk-latest --repo "$GITHUB_REPOSITORY" \
-            --title "Noor ${VER} - ${TYPE} APK" \
-            --notes "Verified standalone build of https://github.com/adangalma30-cloud/Noor (${TYPE}).
-
-          File: ${ASSET}
-          Size: $(stat -c%s "$ASSET") bytes
-          SHA-256: ${SHA}
-
-          Checks passed: entry CRCs (unzip -t), zipalign, apksigner verify, aapt2 identity, JS bundle embedded." \
-            "$ASSET" "${ASSET}.sha256"
-          {
-            echo "## Direct download"
-            echo "- APK: https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/${ASSET}"
-            echo "- SHA-256: \`${SHA}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK files
+        uses: actions/upload-artifact@v4
+        with:
+          name: noor-apk-files
+          path: noor/android/app/build/outputs/apk/**/*.apk
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Upload Gradle reports on failure
         if: failure()
@@ -203,3 +216,153 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  install-test:
+    name: Install & launch test (adb on emulator)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: noor-apk-files
+          path: apks
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install and launch on Android emulator
+        id: test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: |
+            set -e
+            # Prefer the x86_64-specific APK (smaller/faster), fall back to universal.
+            APK=$(find apks -name "*.apk" | grep "x86_64" | head -1)
+            [ -z "$APK" ] && APK=$(find apks -name "*.apk" | grep -i "universal" | head -1)
+            [ -z "$APK" ] && APK=$(find apks -name "*.apk" | sort | tail -1)
+            echo "Installing: $APK ($(du -h "$APK" | cut -f1))"
+            adb install -r "$APK" | tee install-out.txt
+            grep -q "Success" install-out.txt
+            echo "Launching com.adangalma30.noor/.MainActivity"
+            adb shell am start -n com.adangalma30.noor/.MainActivity | tee launch-out.txt
+            sleep 18
+            PID=$(adb shell pidof com.adangalma30.noor | tr -d '\r' || true)
+            echo "pid: '$PID'"
+            test -n "$PID"
+            adb shell dumpsys activity activities | grep -i "ResumedActivity" | tee resumed.txt
+            grep -qi "noor" resumed.txt
+            adb logcat -d > logcat.txt || true
+            if grep -q "FATAL EXCEPTION" logcat.txt && grep -qi "noor" logcat.txt; then
+              echo "FATAL exception found for Noor"
+              exit 1
+            fi
+            echo "INSTALL AND LAUNCH TEST: PASSED"
+
+      - name: Write install test result
+        if: always()
+        run: |
+          if [ "${{ steps.test.outcome }}" = "success" ]; then
+            echo "Install & launch on Android emulator (API 30, x86_64): **PASSED** — \`adb install\` returned Success, the app process survived launch (\`pidof\` non-empty after 18 s), the resumed activity is Noor, and no FATAL exception was logged." > install-test-result.md
+          else
+            echo "Install & launch on Android emulator (API 30, x86_64): **FAILED** — see the uploaded logcat/install artifacts. Installation was NOT verified." > install-test-result.md
+          fi
+          cat install-test-result.md
+
+      - name: Upload install test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-test
+          path: |
+            install-test-result.md
+            logcat.txt
+            install-out.txt
+            launch-out.txt
+            resumed.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Publish release + validation report
+    needs: [build, install-test]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Noor (for version metadata)
+        uses: actions/checkout@v4
+        with:
+          repository: adangalma30-cloud/Noor
+          ref: ${{ inputs.app_ref || 'main' }}
+          path: noor
+
+      - name: Download APKs and reports
+        uses: actions/download-artifact@v4
+        with:
+          path: collected
+
+      - name: Assemble release assets
+        run: |
+          TYPE="${{ inputs.build_type || 'release' }}"
+          VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
+          mkdir -p assets
+          cp collected/noor-apk-files/*.apk assets/ 2>/dev/null || find collected -name "*.apk" -exec cp {} assets/ \;
+          cd assets
+          for A in *.apk; do
+            SHA=$(sha256sum "$A" | cut -d' ' -f1)
+            ABI="universal"
+            case "$A" in
+              *arm64-v8a*) ABI="arm64-v8a";;
+              *armeabi-v7a*) ABI="armeabi-v7a";;
+              *x86_64*) ABI="x86_64";;
+              *x86*) ABI="x86";;
+            esac
+            NEW="Noor-${VER}-${TYPE}-${SHA:0:8}-${ABI}.apk"
+            mv "$A" "$NEW"
+            echo "${SHA}  ${NEW}" > "${NEW}.sha256"
+          done
+          cd ..
+          cp collected/noor-apks/verify-summary.md assets/Noor-${VER}-VALIDATION-REPORT.md
+          {
+            echo ""
+            echo "## Install & launch test (adb on Android emulator)"
+            echo ""
+            cat collected/install-test/install-test-result.md 2>/dev/null || echo "_Install test result unavailable._"
+            echo ""
+            echo "## Sizes"
+            echo ""
+            echo "| asset | bytes |"
+            echo "|---|---|"
+            for F in assets/*.apk; do
+              echo "| $(basename "$F") | $(stat -c%s "$F") |"
+            done
+          } >> assets/Noor-${VER}-VALIDATION-REPORT.md
+          echo "=== assets ==="
+          ls -la assets/
+
+      - name: Upload as direct download (GitHub Release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TYPE="${{ inputs.build_type || 'release' }}"
+          VER=$(python3 -c "import json;print(json.load(open('noor/app.json'))['expo']['version'])")
+          gh release delete apk-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create apk-latest --repo "$GITHUB_REPOSITORY" \
+            --title "Noor ${VER} - ${TYPE} APKs" \
+            --notes "Verified builds of https://github.com/adangalma30-cloud/Noor (${TYPE}).
+
+          Per-architecture APKs plus a universal fallback — install the one for your device (Samsung Galaxy A15 → arm64-v8a). Every APK passed: zip entry CRCs, zipalign, apksigner verify, signing-certificate continuity with 0.0.1–0.0.3, package/version identity, minSdk 24, embedded JS bundle. See Noor-${VER}-VALIDATION-REPORT.md for the full report including the adb install & launch test." \
+            assets/*.apk assets/*.sha256 assets/Noor-${VER}-VALIDATION-REPORT.md
+          {
+            echo "## Direct download"
+            for F in assets/*.apk; do
+              echo "- $(basename "$F") — $(stat -c%s "$F") bytes"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
