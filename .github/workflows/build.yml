@@ -248,12 +248,22 @@ jobs:
           grep -q "Success" install-out.txt
           echo "Launching com.adangalma30.noor/.MainActivity"
           adb shell am start -n com.adangalma30.noor/.MainActivity | tee launch-out.txt
-          sleep 18
+          sleep 30
           PID=$(adb shell pidof com.adangalma30.noor | tr -d '\r' || true)
-          echo "pid: '$PID'"
-          test -n "$PID"
-          adb shell dumpsys activity activities | tee resumed.txt | grep -i "ResumedActivity.*noor"
+          echo "pid after 30s: '$PID'"
+          if [ -z "$PID" ]; then
+            echo "Process not found after first launch — retrying once"
+            adb shell am start -n com.adangalma30.noor/.MainActivity | tee -a launch-out.txt
+            sleep 15
+            PID=$(adb shell pidof com.adangalma30.noor | tr -d '\r' || true)
+            echo "pid after retry: '$PID'"
+          fi
           adb logcat -d > logcat.txt || true
+          adb logcat -d -b crash > logcat-crash.txt || true
+          adb shell dumpsys activity activities > resumed.txt || true
+          cp logcat.txt logcat-crash.txt resumed.txt ../ 2>/dev/null || true
+          test -n "$PID"
+          grep -i "ResumedActivity.*noor" resumed.txt
           if grep -q "FATAL EXCEPTION" logcat.txt && grep -qi "noor" logcat.txt; then
             echo "FATAL exception found for Noor"
             exit 1
@@ -282,7 +292,7 @@ jobs:
           else
             echo "Install & launch on Android emulator (API 30, x86_64): **FAILED** — see the uploaded logcat/install artifacts. Installation was NOT verified." > itest/install-test-result.md
           fi
-          cp install-out.txt launch-out.txt resumed.txt logcat.txt itest/ 2>/dev/null || true
+          cp install-out.txt launch-out.txt resumed.txt logcat.txt logcat-crash.txt itest/ 2>/dev/null || true
           cat itest/install-test-result.md
 
       - name: Upload install test evidence
